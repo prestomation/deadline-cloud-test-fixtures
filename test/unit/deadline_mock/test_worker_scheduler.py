@@ -239,7 +239,12 @@ def test_task_after_failure_is_a_violation(client: Any, backend: MockDeadlineBac
         backend,
         worker_id,
         {
-            task_1: {"completedStatus": "FAILED", "startedAt": start, "endedAt": start},
+            task_1: {
+                "completedStatus": "FAILED",
+                "startedAt": start,
+                "endedAt": start,
+                "processExitCode": 1,
+            },
             task_2: {"completedStatus": "SUCCEEDED", "startedAt": start, "endedAt": end},
         },
     )
@@ -256,14 +261,23 @@ def test_cancel_lists_the_action_and_later_tasks_but_not_env_exit(
     worker_id = _start_worker(client, backend)
     session_id = _open(backend, worker_id, ENTER, TASK, TASK)
     enter_id, task_1, task_2 = _ids(_schedule(client, backend, worker_id), session_id)
-    (exit_id,) = scheduler.close_session(session_id)
+    # The envEnter is not reported yet, so closing queues no envExit.
+    assert scheduler.close_session(session_id) == []
 
     canceled = scheduler.cancel_action(task_1)
-    response = _schedule(client, backend, worker_id)
+    start, end = _times()
+    response = _schedule(
+        client,
+        backend,
+        worker_id,
+        {enter_id: {"completedStatus": "SUCCEEDED", "startedAt": start, "endedAt": end}},
+    )
 
     assert canceled == [task_1, task_2]
     assert response["cancelSessionActions"] == {session_id: [task_1, task_2]}
-    assert _ids(response, session_id) == [enter_id, task_1, task_2, exit_id]
+    (exit_id,) = _ids(response, session_id)[2:]
+    assert _ids(response, session_id) == [task_1, task_2, exit_id]
+    assert scheduler.action(exit_id).kind == "envExit"
 
 
 def test_never_attempted_while_earlier_action_runs_is_a_violation(
@@ -471,3 +485,199 @@ def test_snapshot_includes_worker_protocol_state(client: Any, backend: MockDeadl
     assert snapshot["workers"][0]["statusHistory"] == ["CREATED", "STARTED"]
     assert snapshot["sessions"][0]["actions"][0]["kind"] == "taskRun"
     assert snapshot["violations"] == []
+
+
+def _add_job(backend: MockDeadlineBackend) -> None:
+    backend.worker_scheduler.add_job(
+        job_id=JOB_ID,
+        job_details={"logGroupName": "/aws/deadline/mock", "schemaVersion": "jobtemplate-2023-09"},
+        steps={STEP_ID: {"schemaVersion": "jobtemplate-2023-09", "template": {"name": "S"}}},
+    )
+
+
+def _get_step(client: Any, backend: MockDeadlineBackend, worker_id: str) -> dict[str, Any]:
+    return client.batch_get_job_entity(
+        farmId=backend.farm_id,
+        fleetId=FLEET_ID,
+        workerId=worker_id,
+        identifiers=[{"stepDetails": {"jobId": JOB_ID, "stepId": STEP_ID}}],
+    )
+
+
+def test_injected_entity_error_is_returned_once(client: Any, backend: MockDeadlineBackend) -> None:
+    _add_job(backend)
+    worker_id = _start_worker(client, backend)
+    _open(backend, worker_id, TASK)
+    backend.worker_scheduler.inject_entity_error(
+        kind="stepDetails", job_id=JOB_ID, entity_id=STEP_ID, code="InternalServerException"
+    )
+
+    first = _get_step(client, backend, worker_id)
+    second = _get_step(client, backend, worker_id)
+
+    assert first["errors"][0]["stepDetails"]["code"] == "InternalServerException"
+    assert second["entities"][0]["stepDetails"]["stepId"] == STEP_ID
+
+
+def test_task_that_succeeds_after_its_step_fetch_failed_is_a_violation(
+    client: Any, backend: MockDeadlineBackend
+) -> None:
+    _add_job(backend)
+    worker_id = _start_worker(client, backend)
+    session_id = _open(backend, worker_id, TASK)
+    (task_id,) = _ids(_schedule(client, backend, worker_id), session_id)
+    backend.worker_scheduler.inject_entity_error(
+        kind="stepDetails", job_id=JOB_ID, entity_id=STEP_ID, code="ValidationException"
+    )
+    _get_step(client, backend, worker_id)
+    start = datetime.now(timezone.utc)
+    end = start + timedelta(seconds=1)
+
+    _schedule(
+        client,
+        backend,
+        worker_id,
+        {task_id: {"completedStatus": "SUCCEEDED", "startedAt": start, "endedAt": end}},
+    )
+
+    assert [v.rule for v in backend.worker_scheduler.violations] == ["ran-despite-entity-error"]
+
+
+def test_queue_role_credentials_name_their_queue(client: Any, backend: MockDeadlineBackend) -> None:
+    backend.worker_scheduler.queue_role_arns[backend.queue_id] = "arn:aws:iam::1:role/Queue"
+    worker_id = _start_worker(client, backend)
+    _open(backend, worker_id, TASK)
+
+    response = client.assume_queue_role_for_worker(
+        farmId=backend.farm_id, fleetId=FLEET_ID, workerId=worker_id, queueId=backend.queue_id
+    )
+
+    assert response["credentials"]["accessKeyId"] == f"ASIAQUEUE{backend.queue_id[-8:].upper()}"
+
+
+def test_running_after_queue_role_not_found_is_a_violation(
+    client: Any, backend: MockDeadlineBackend
+) -> None:
+    scheduler = backend.worker_scheduler
+    scheduler.queue_role_arns[backend.queue_id] = "arn:aws:iam::1:role/Queue"
+    worker_id = _start_worker(client, backend)
+    session_id = _open(backend, worker_id, TASK)
+    (task_id,) = _ids(_schedule(client, backend, worker_id), session_id)
+    scheduler.inject_queue_role_error(backend.queue_id, "ResourceNotFoundException")
+
+    with pytest.raises(ClientError):
+        client.assume_queue_role_for_worker(
+            farmId=backend.farm_id,
+            fleetId=FLEET_ID,
+            workerId=worker_id,
+            queueId=backend.queue_id,
+        )
+    start, end = _times()
+    _schedule(
+        client,
+        backend,
+        worker_id,
+        {task_id: {"completedStatus": "SUCCEEDED", "startedAt": start, "endedAt": end}},
+    )
+
+    assert scheduler.queue_role_calls[-1][2] == "ResourceNotFoundException"
+    assert [v.rule for v in scheduler.violations] == ["ran-after-queue-role-error"]
+
+
+def test_not_responding_worker_gets_a_status_conflict(
+    client: Any, backend: MockDeadlineBackend
+) -> None:
+    worker_id = _start_worker(client, backend)
+    session_id = _open(backend, worker_id, TASK)
+    backend.worker_scheduler.mark_not_responding(worker_id)
+
+    with pytest.raises(ClientError) as raised:
+        _schedule(client, backend, worker_id)
+
+    assert raised.value.response["reason"] == "STATUS_CONFLICT"
+    assert backend.worker_scheduler.sessions[session_id].ended
+
+
+def test_forgotten_worker_gets_resource_not_found(
+    client: Any, backend: MockDeadlineBackend
+) -> None:
+    worker_id = _start_worker(client, backend)
+    backend.worker_scheduler.forget_worker(worker_id)
+
+    with pytest.raises(ClientError) as raised:
+        _schedule(client, backend, worker_id)
+
+    assert raised.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_operation_delay_slows_only_that_operation(
+    client: Any, backend: MockDeadlineBackend
+) -> None:
+    worker_id = _start_worker(client, backend)
+    backend.operation_delays["UpdateWorkerSchedule"] = 0.5
+
+    started = datetime.now(timezone.utc)
+    _schedule(client, backend, worker_id)
+    slow = datetime.now(timezone.utc) - started
+    started = datetime.now(timezone.utc)
+    client.assume_fleet_role_for_worker(
+        farmId=backend.farm_id, fleetId=FLEET_ID, workerId=worker_id
+    )
+    fast = datetime.now(timezone.utc) - started
+
+    assert slow >= timedelta(seconds=0.5) > fast
+
+
+def test_env_enter_failed_without_a_process_needs_no_exit(
+    client: Any, backend: MockDeadlineBackend
+) -> None:
+    scheduler = backend.worker_scheduler
+    worker_id = _start_worker(client, backend)
+    session_id = _open(backend, worker_id, ENTER, TASK)
+    enter_id, task_id = _ids(_schedule(client, backend, worker_id), session_id)
+    now = datetime.now(timezone.utc)
+
+    response = _schedule(
+        client,
+        backend,
+        worker_id,
+        {
+            enter_id: {"completedStatus": "FAILED", "startedAt": now, "endedAt": now},
+            task_id: {"completedStatus": "NEVER_ATTEMPTED"},
+        },
+    )
+    (exit_id,) = _ids(response, session_id)
+    _schedule(client, backend, worker_id, {exit_id: {"completedStatus": "NEVER_ATTEMPTED"}})
+    scheduler.check_session_complete(session_id)
+
+    assert scheduler.violations == []
+
+
+def test_queue_role_error_is_cleared_by_a_later_success(
+    client: Any, backend: MockDeadlineBackend
+) -> None:
+    scheduler = backend.worker_scheduler
+    scheduler.queue_role_arns[backend.queue_id] = "arn:aws:iam::1:role/Queue"
+    worker_id = _start_worker(client, backend)
+    session_id = _open(backend, worker_id, TASK)
+    (task_id,) = _ids(_schedule(client, backend, worker_id), session_id)
+    scheduler.inject_queue_role_error(backend.queue_id, "ResourceNotFoundException")
+    request = {
+        "farmId": backend.farm_id,
+        "fleetId": FLEET_ID,
+        "workerId": worker_id,
+        "queueId": backend.queue_id,
+    }
+    with pytest.raises(ClientError):
+        client.assume_queue_role_for_worker(**request)
+    client.assume_queue_role_for_worker(**request)
+    start, end = _times()
+
+    _schedule(
+        client,
+        backend,
+        worker_id,
+        {task_id: {"completedStatus": "SUCCEEDED", "startedAt": start, "endedAt": end}},
+    )
+
+    assert scheduler.violations == []

@@ -149,6 +149,8 @@ class MockDeadlineBackend:
         self.unmatched_requests: list[tuple[str, str]] = []
         # Errors to return instead of calling a route, keyed by operation name.
         self.injected_errors: dict[str, list[ClientError]] = {}
+        # Extra seconds to wait before answering, keyed by operation name.
+        self.operation_delays: dict[str, float] = {}
         self.worker_scheduler = self._new_worker_scheduler()
         self.scenario.seed(self)
 
@@ -175,6 +177,7 @@ class MockDeadlineBackend:
             self.request_log.clear()
             self.unmatched_requests.clear()
             self.injected_errors.clear()
+            self.operation_delays.clear()
             self.jobs.clear()
             self.worker_scheduler = self._new_worker_scheduler()
             self.scenario.seed(self)
@@ -618,8 +621,9 @@ def _make_handler(
                 match = pattern.match(parsed.path)
                 if route_method != method or match is None:
                     continue
-                if backend.response_delay_s:
-                    time.sleep(backend.response_delay_s)
+                delay = backend.response_delay_s + backend.operation_delays.get(operation, 0.0)
+                if delay:
+                    time.sleep(delay)
                 with backend._lock:
                     backend.call_counts[operation] = backend.call_counts.get(operation, 0) + 1
                     backend.request_log.append((method, parsed.path, operation))

@@ -38,6 +38,10 @@ TERMINAL_STATUSES = frozenset({"SUCCEEDED", "FAILED", "INTERRUPTED", "CANCELED",
 """Values of ``completedStatus`` in ``UpdateWorkerSchedule`` requests."""
 
 _UNSUCCESSFUL = frozenset({"FAILED", "INTERRUPTED", "CANCELED"})
+_TERMINAL_QUEUE_ROLE_ERRORS = frozenset({"ResourceNotFoundException"})
+"""AssumeQueueRoleForWorker errors after which the protocol says to fail the session.
+For AccessDeniedException and most conflicts the worker may also run without
+credentials, so those are not checked."""
 _ONLINE_STATUSES = frozenset({"STARTED", "STOPPING"})
 _WORKER_STATUS_ORDER = ("CREATED", "STARTED", "STOPPING", "STOPPED")
 
@@ -155,6 +159,10 @@ class MockWorkerSession:
     metadata: dict[str, str] | None = None
     closing: bool = False
     ended: bool = False
+    opened_at: datetime = field(default_factory=_now)
+    queue_role_error: str | None = None
+    """Error code of a failed ``AssumeQueueRoleForWorker`` call made while this session
+    was waiting to start. After a terminal error the session must not run."""
     accepts_work: bool = True
     """False once the service canceled work in, or closed, the session. After that
     the service only adds ``envExit`` actions."""
@@ -178,6 +186,20 @@ class MockWorkerSession:
             str(action.environment_id)
             for action in self.actions
             if action.kind == "envEnter" and action.was_attempted
+        ]
+
+    def environments_needing_exit(self) -> list[str]:
+        """Environments whose ``envEnter`` started a process or succeeded.
+
+        A worker may report an ``envEnter`` as ``FAILED`` without running it, for example
+        when it cannot fetch ``jobDetails`` for a new session. Such a report has no
+        ``processExitCode``, and nothing needs to be exited.
+        """
+        return [
+            str(action.environment_id)
+            for action in self.actions
+            if action.kind == "envEnter"
+            and (action.status == "SUCCEEDED" or action.process_exit_code is not None)
         ]
 
     def queued_exit_ids(self) -> set[str]:
@@ -222,6 +244,12 @@ class MockWorkerScheduler:
         self._action_index: dict[str, str] = {}
         self.job_entities: dict[tuple[str, str, str], dict[str, Any]] = {}
         self.violations: list[ProtocolViolation] = []
+        self._entity_errors: dict[tuple[str, str, str], list[str]] = {}
+        self._queue_role_errors: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+        # (worker key, job ID, entity kind, entity ID) -> list of (time, outcome code).
+        self.entity_fetches: dict[tuple[tuple[str, str, str], str, str, str], list] = {}
+        self.queue_role_calls: list[tuple[str, str, str]] = []
+        """(worker ID, queue ID, outcome) for every AssumeQueueRoleForWorker call."""
 
     # ------------------------------------------------------------------
     # Test-side API: register job data and decide what the worker runs.
@@ -374,20 +402,24 @@ class MockWorkerScheduler:
     def close_session(self, session_id: str) -> list[str]:
         """End a session once its work is done. Returns the IDs of added ``envExit`` actions.
 
-        The service queues an ``envExit`` for every environment that was entered or is
-        still waiting to be entered, in reverse order, then drops the session from
+        Like the service, the mock queues ``envExit`` actions only once the worker has
+        reported every ``envEnter``: one for each environment whose ``envEnter`` was
+        attempted, inner-most first. Until then this returns an empty list, and the
+        exits are queued when the last ``envEnter`` report arrives. The session leaves
         ``UpdateWorkerSchedule`` responses once every action has ended.
         """
         with self._lock:
             session = self.sessions[session_id]
             session.closing = True
             session.accepts_work = False
-            environment_ids = [
-                str(action.environment_id)
-                for action in session.actions
-                if action.kind == "envEnter" and action.status != "NEVER_ATTEMPTED"
-            ]
-            return self._queue_exits(session, environment_ids)
+            return self._queue_closing_exits(session)
+
+    def _queue_closing_exits(self, session: MockWorkerSession) -> list[str]:
+        if not session.closing or any(
+            action.kind == "envEnter" and not action.is_terminal for action in session.actions
+        ):
+            return []
+        return self._queue_exits(session, session.entered_environment_ids())
 
     def drain(self, worker_id: str, *, immediate: bool) -> None:
         """Start a service-initiated drain.
@@ -426,6 +458,50 @@ class MockWorkerScheduler:
             session = self.sessions[self._action_index[session_action_id]]
             return session.actions[session.index_of(session_action_id)]
 
+    def inject_entity_error(
+        self, *, kind: str, job_id: str, entity_id: str, code: str, count: int = 1
+    ) -> None:
+        """Make ``BatchGetJobEntity`` return ``code`` in ``errors`` for one entity.
+
+        ``kind`` is ``jobDetails``, ``stepDetails``, ``environmentDetails`` or
+        ``jobAttachmentDetails``. ``entity_id`` is the job, step or environment ID.
+        The error is returned for the next ``count`` requests of that entity.
+        """
+        with self._lock:
+            self._entity_errors.setdefault((kind, job_id, entity_id), []).extend([code] * count)
+
+    def inject_queue_role_error(
+        self, queue_id: str, code: str, *, count: int = 1, **fields: Any
+    ) -> None:
+        """Make the next ``count`` ``AssumeQueueRoleForWorker`` calls for a queue fail.
+
+        ``fields`` become members of the error, for example ``reason="STATUS_CONFLICT"``
+        and ``resourceId=...`` for a ``ConflictException``.
+        """
+        with self._lock:
+            self._queue_role_errors.setdefault(queue_id, []).extend([(code, fields)] * count)
+
+    def mark_not_responding(self, worker_id: str) -> None:
+        """Set the worker to ``NOT_RESPONDING``, as the service does when heartbeats stop.
+
+        Later worker calls get a ``STATUS_CONFLICT``. The service takes the work back,
+        so the worker's sessions end without further reports.
+        """
+        with self._lock:
+            worker = self._worker_by_id(worker_id)
+            worker.status = "NOT_RESPONDING"
+            worker.status_history.append("NOT_RESPONDING")
+            for session in self._sessions_for(worker.key):
+                session.ended = True
+
+    def forget_worker(self, worker_id: str) -> None:
+        """Delete the worker on the service side. Later worker calls get a 404."""
+        with self._lock:
+            worker = self._worker_by_id(worker_id)
+            for session in self._sessions_for(worker.key):
+                session.ended = True
+            del self.workers[worker.key]
+
     def check_session_complete(self, session_id: str, *, worker_drained: bool = False) -> None:
         """Add a violation for each rule a finished session breaks.
 
@@ -459,7 +535,7 @@ class MockWorkerScheduler:
                 for action in session.actions
                 if action.kind == "envExit" and action.canceled_by_service
             }
-            for environment_id in session.entered_environment_ids():
+            for environment_id in session.environments_needing_exit():
                 if environment_id not in exited and environment_id not in canceled_exits:
                     self._violate(
                         "entered-environment-not-exited",
@@ -573,21 +649,45 @@ class MockWorkerScheduler:
         self, *, farmId: str, fleetId: str, workerId: str, queueId: str
     ) -> dict[str, Any]:
         with self._lock:
-            worker = self._worker(farmId, fleetId, workerId, "AssumeQueueRoleForWorker")
-            if worker.status not in _ONLINE_STATUSES:
-                raise _status_conflict("AssumeQueueRoleForWorker", workerId, worker.status)
-            if not any(
-                session.queue_id == queueId and not session.ended
-                for session in self._sessions_for(worker.key)
-            ):
-                raise _client_error(
-                    "AssumeQueueRoleForWorker",
-                    "AccessDeniedException",
-                    f"Worker {workerId} has no session for queue {queueId}",
+            try:
+                worker = self._worker(farmId, fleetId, workerId, "AssumeQueueRoleForWorker")
+                if worker.status not in _ONLINE_STATUSES:
+                    raise _status_conflict("AssumeQueueRoleForWorker", workerId, worker.status)
+                sessions = [
+                    session
+                    for session in self._sessions_for(worker.key)
+                    if session.queue_id == queueId
+                ]
+                if not sessions:
+                    raise _client_error(
+                        "AssumeQueueRoleForWorker",
+                        "AccessDeniedException",
+                        f"Worker {workerId} has no session for queue {queueId}",
+                    )
+                pending = self._queue_role_errors.get(queueId)
+                if pending:
+                    code, fields = pending.pop(0)
+                    # Blame only sessions the worker has received and not started.
+                    for session in sessions:
+                        received = any(a.first_sent_in_call is not None for a in session.actions)
+                        started = any(a.was_attempted for a in session.actions)
+                        if received and not started:
+                            session.queue_role_error = code
+                    raise _client_error(
+                        "AssumeQueueRoleForWorker", code, "Injected by the test", **fields
+                    )
+            except ClientError as error:
+                self.queue_role_calls.append(
+                    (workerId, queueId, str(error.response["Error"]["Code"]))
                 )
+                raise
+            self.queue_role_calls.append((workerId, queueId, "OK"))
+            # A later successful call gives the waiting sessions their credentials.
+            for session in sessions:
+                session.queue_role_error = None
         if queueId not in self.queue_role_arns:
             return {}
-        return {"credentials": self._credentials()}
+        return {"credentials": self._credentials(f"ASIAQUEUE{queueId[-8:].upper()}")}
 
     def batch_get_job_entity(
         self, *, farmId: str, fleetId: str, workerId: str, identifiers: list[dict[str, Any]]
@@ -602,13 +702,18 @@ class MockWorkerScheduler:
                 job_id = fields["jobId"]
                 entity_id = fields.get("stepId") or fields.get("environmentId") or job_id
                 entity = self.job_entities.get((kind, job_id, entity_id))
+                injected = self._entity_errors.get((kind, job_id, entity_id))
                 if job_id not in jobs:
                     code, message = "AccessDeniedException", "No session for this job"
+                elif injected:
+                    code, message = injected.pop(0), "Injected by the test"
                 elif entity is None:
                     code, message = "ResourceNotFoundException", f"No {kind} for {entity_id}"
                 else:
                     entities.append({kind: dict(entity)})
+                    self._record_fetch(worker, kind, job_id, entity_id, "OK")
                     continue
+                self._record_fetch(worker, kind, job_id, entity_id, code)
                 errors.append({kind: {**fields, "code": code, "message": message}})
             return {"entities": entities, "errors": errors}
 
@@ -642,6 +747,58 @@ class MockWorkerScheduler:
     # Internals.
     # ------------------------------------------------------------------
 
+    def _record_fetch(
+        self, worker: MockWorker, kind: str, job_id: str, entity_id: str, outcome: str
+    ) -> None:
+        self.entity_fetches.setdefault((worker.key, job_id, kind, entity_id), []).append(
+            (_now(), outcome)
+        )
+
+    def _entity_outcome_before(
+        self, session: MockWorkerSession, kind: str, entity_id: str, when: datetime
+    ) -> str | None:
+        """How the worker's fetches of an entity went between the session opening and ``when``.
+
+        Returns ``"OK"`` if any fetch succeeded, the last error code if all failed, or
+        ``None`` if there was no fetch. The worker caches entities per session, but the
+        service cannot tell which session a fetch is for, so one success is enough.
+        """
+        fetches = self.entity_fetches.get((session.worker_key, session.job_id, kind, entity_id))
+        outcome = None
+        for fetched_at, result in fetches or ():
+            if session.opened_at <= fetched_at <= when + timedelta(seconds=1):
+                if result == "OK":
+                    return "OK"
+                outcome = result
+        return outcome
+
+    def _check_entities(
+        self,
+        session: MockWorkerSession,
+        action: MockSessionAction,
+        completed: str | None,
+        started_at: datetime | None,
+    ) -> None:
+        """An action whose details could not be fetched must not run or succeed."""
+        if completed not in (None, "SUCCEEDED") or action.kind == "envExit":
+            return
+        when = started_at or _now()
+        needed = [("jobDetails", session.job_id)]
+        if action.kind == "taskRun":
+            needed.append(("stepDetails", str(action.definition["stepId"])))
+        elif action.kind == "envEnter":
+            needed.append(("environmentDetails", str(action.environment_id)))
+        for kind, entity_id in needed:
+            outcome = self._entity_outcome_before(session, kind, entity_id, when)
+            if outcome not in (None, "OK", "MaxPayloadSizeExceeded"):
+                self._violate(
+                    "ran-despite-entity-error",
+                    f"{action.kind} was {completed or 'RUNNING'} though its {kind} "
+                    f"fetch returned {outcome}",
+                    session,
+                    action,
+                )
+
     def _violate(
         self,
         rule: str,
@@ -658,9 +815,11 @@ class MockWorkerScheduler:
             )
         )
 
-    def _credentials(self) -> dict[str, Any]:
+    def _credentials(self, access_key_id: str = _FAKE_CREDENTIALS_KEY) -> dict[str, Any]:
+        """Credentials whose access key ID says whose they are, so a test can tell
+        fleet credentials and each queue's credentials apart."""
         return {
-            "accessKeyId": _FAKE_CREDENTIALS_KEY,
+            "accessKeyId": access_key_id,
             "secretAccessKey": "mock-secret",
             "sessionToken": "mock-session-token",
             "expiration": _now() + timedelta(hours=1),
@@ -828,6 +987,20 @@ class MockWorkerScheduler:
                             later,
                         )
             self._check_allowed_after_failure(session, index, action, completed)
+            if action.status == "ASSIGNED":
+                self._check_entities(session, action, completed, started_at)
+                if (
+                    session.queue_role_error in _TERMINAL_QUEUE_ROLE_ERRORS
+                    and completed in (None, "SUCCEEDED")
+                    and action.kind != "envExit"
+                ):
+                    self._violate(
+                        "ran-after-queue-role-error",
+                        f"{action.kind} ran though AssumeQueueRoleForWorker returned "
+                        f"{session.queue_role_error}",
+                        session,
+                        action,
+                    )
 
         if completed is None:
             action.status = "RUNNING"
@@ -859,10 +1032,20 @@ class MockWorkerScheduler:
         if session.blocked_at is None or index < session.blocked_at:
             return
         if action.kind != "envExit":
+            blocker = session.actions[session.blocked_at]
+            ran = completed in (None, "SUCCEEDED") or "processExitCode" in action.reports[-1]
+            if not ran:
+                rule = "rejected-instead-of-never-attempted"
+            elif blocker.process_exit_code is None:
+                # The blocking action failed without running a process, as when the
+                # worker cannot set up the session.
+                rule = "ran-after-setup-failure"
+            else:
+                rule = "ran-after-unsuccessful-action"
             self._violate(
-                "ran-after-unsuccessful-action",
-                f"{action.kind} was attempted after action {session.blocked_at} ended "
-                f"{session.actions[session.blocked_at].status}",
+                rule,
+                f"{action.kind} was {completed or 'RUNNING'} after action "
+                f"{session.blocked_at} ended {blocker.status}",
                 session,
                 action,
             )
@@ -879,6 +1062,7 @@ class MockWorkerScheduler:
         assigned: dict[str, Any] = {}
         cancels: dict[str, list[str]] = {}
         for session in self._sessions_for(worker.key):
+            self._queue_closing_exits(session)
             if session.closing and session.all_terminal:
                 session.ended = True
                 continue
