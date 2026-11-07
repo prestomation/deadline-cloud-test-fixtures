@@ -32,12 +32,26 @@ from openjd.model import (
 )
 
 from .scenario import _FAKE_PRINCIPAL, MockDeadlineScenario
+from .worker_scheduler import MockWorkerScheduler
 
 API_PREFIX = "/2023-10-12"
 ADMIN_STATE_PATH = "/__deadline_test_fixtures__/state"
 ADMIN_RESET_PATH = "/__deadline_test_fixtures__/reset"
 
 _INT_QUERY_PARAMS = {"maxResults", "itemOffset", "pageSize"}
+
+# HTTP status for each modeled error code. botocore reads the code from the
+# x-amzn-errortype header; the status keeps the wire format close to the service.
+_ERROR_STATUS = {
+    "AccessDeniedException": 403,
+    "ConflictException": 409,
+    "InternalServerErrorException": 500,
+    "InternalServerException": 500,
+    "ResourceNotFoundException": 404,
+    "ServiceQuotaExceededException": 402,
+    "ThrottlingException": 429,
+    "ValidationException": 400,
+}
 _MAX_BODY_BYTES = 10 * 1024 * 1024
 
 # CreateJob's JobParameter union members, mapped to Open Job Description value types.
@@ -133,6 +147,9 @@ class MockDeadlineBackend:
         self.call_counts: dict[str, int] = {}
         self.request_log: list[tuple[str, str, str]] = []
         self.unmatched_requests: list[tuple[str, str]] = []
+        # Errors to return instead of calling a route, keyed by operation name.
+        self.injected_errors: dict[str, list[ClientError]] = {}
+        self.worker_scheduler = self._new_worker_scheduler()
         self.scenario.seed(self)
 
     @property
@@ -143,14 +160,49 @@ class MockDeadlineBackend:
     def queue_id(self) -> str:
         return self.scenario.queue_id
 
+    def _new_worker_scheduler(self) -> MockWorkerScheduler:
+        queue = self.scenario.queue
+        role_arn = queue.get("roleArn")
+        return MockWorkerScheduler(
+            queue_role_arns={str(queue["queueId"]): str(role_arn)} if role_arn else {}
+        )
+
     def reset(self) -> None:
-        """Restore scenario resources, discard created jobs, and clear request observability."""
+        """Restore scenario resources, discard created jobs and workers, and clear
+        request observability."""
         with self._lock:
             self.call_counts.clear()
             self.request_log.clear()
             self.unmatched_requests.clear()
+            self.injected_errors.clear()
             self.jobs.clear()
+            self.worker_scheduler = self._new_worker_scheduler()
             self.scenario.seed(self)
+
+    def inject_error(
+        self,
+        operation: str,
+        code: str,
+        *,
+        count: int = 1,
+        message: str = "Injected by the test",
+        **fields: Any,
+    ) -> None:
+        """Make the next ``count`` calls to ``operation`` fail with ``code``.
+
+        ``fields`` become members of the error body, for example
+        ``reason="CONCURRENT_MODIFICATION"`` on a ``ConflictException`` or
+        ``retryAfterSeconds=1`` on a ``ThrottlingException``. The route is not called,
+        so the request has no effect, as with a real failed request.
+        """
+        error = ClientError({"Error": {"Code": code, "Message": message, **fields}}, operation)
+        with self._lock:
+            self.injected_errors.setdefault(operation, []).extend([error] * count)
+
+    def _take_injected_error(self, operation: str) -> ClientError | None:
+        with self._lock:
+            pending = self.injected_errors.get(operation)
+            return pending.pop(0) if pending else None
 
     def snapshot(self) -> dict[str, Any]:
         """Return JSON-serializable state for remote assertions."""
@@ -178,6 +230,7 @@ class MockDeadlineBackend:
                     ],
                     "jobs": list(self.jobs.values()),
                 },
+                "worker_protocol": self.worker_scheduler.snapshot(),
             }
 
     def _log(self, message: str) -> None:
@@ -373,6 +426,77 @@ class MockDeadlineBackend:
         except KeyError:
             raise _resource_not_found("job", jobId, "GetJob")
 
+    # Worker APIs. The worker protocol state lives in self.worker_scheduler.
+
+    @route("POST", "/farms/{farmId}/fleets/{fleetId}/workers", "CreateWorker")
+    def create_worker(self, *, farmId: str, fleetId: str, **kwargs: Any) -> dict[str, Any]:
+        return self.worker_scheduler.create_worker(farmId=farmId, fleetId=fleetId, **kwargs)
+
+    @route("PATCH", "/farms/{farmId}/fleets/{fleetId}/workers/{workerId}", "UpdateWorker")
+    def update_worker(
+        self, *, farmId: str, fleetId: str, workerId: str, **kwargs: Any
+    ) -> dict[str, Any]:
+        return self.worker_scheduler.update_worker(
+            farmId=farmId, fleetId=fleetId, workerId=workerId, **kwargs
+        )
+
+    @route("DELETE", "/farms/{farmId}/fleets/{fleetId}/workers/{workerId}", "DeleteWorker")
+    def delete_worker(self, *, farmId: str, fleetId: str, workerId: str) -> dict[str, Any]:
+        return self.worker_scheduler.delete_worker(
+            farmId=farmId, fleetId=fleetId, workerId=workerId
+        )
+
+    @route(
+        "PATCH",
+        "/farms/{farmId}/fleets/{fleetId}/workers/{workerId}/schedule",
+        "UpdateWorkerSchedule",
+    )
+    def update_worker_schedule(
+        self, *, farmId: str, fleetId: str, workerId: str, **kwargs: Any
+    ) -> dict[str, Any]:
+        return self.worker_scheduler.update_worker_schedule(
+            farmId=farmId,
+            fleetId=fleetId,
+            workerId=workerId,
+            updatedSessionActions=kwargs.get("updatedSessionActions"),
+        )
+
+    @route(
+        "POST",
+        "/farms/{farmId}/fleets/{fleetId}/workers/{workerId}/batchGetJobEntity",
+        "BatchGetJobEntity",
+    )
+    def batch_get_job_entity(
+        self, *, farmId: str, fleetId: str, workerId: str, identifiers: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        return self.worker_scheduler.batch_get_job_entity(
+            farmId=farmId, fleetId=fleetId, workerId=workerId, identifiers=identifiers
+        )
+
+    @route(
+        "GET",
+        "/farms/{farmId}/fleets/{fleetId}/workers/{workerId}/fleet-roles",
+        "AssumeFleetRoleForWorker",
+    )
+    def assume_fleet_role_for_worker(
+        self, *, farmId: str, fleetId: str, workerId: str
+    ) -> dict[str, Any]:
+        return self.worker_scheduler.assume_fleet_role_for_worker(
+            farmId=farmId, fleetId=fleetId, workerId=workerId
+        )
+
+    @route(
+        "GET",
+        "/farms/{farmId}/fleets/{fleetId}/workers/{workerId}/queue-roles",
+        "AssumeQueueRoleForWorker",
+    )
+    def assume_queue_role_for_worker(
+        self, *, farmId: str, fleetId: str, workerId: str, queueId: str
+    ) -> dict[str, Any]:
+        return self.worker_scheduler.assume_queue_role_for_worker(
+            farmId=farmId, fleetId=fleetId, workerId=workerId, queueId=queueId
+        )
+
 
 def _json_default(value: Any) -> Any:
     if isinstance(value, datetime):
@@ -417,6 +541,9 @@ class _ResponseValidator:
 
     def _filter(self, shape: Any, value: Any) -> Any:
         if shape is None or value is None:
+            return value
+        if getattr(shape, "is_document_type", False):
+            # A document (such as a step or environment template) is free-form JSON.
             return value
         if shape.type_name == "structure":
             filtered = {
@@ -517,6 +644,9 @@ def _make_handler(
                     )
                     return
                 try:
+                    injected = backend._take_injected_error(operation)
+                    if injected is not None:
+                        raise injected
                     result = function(**arguments)
                     if validator is not None:
                         result = validator.filter_and_validate(operation, result)
@@ -525,12 +655,16 @@ def _make_handler(
                 except ClientError as error:
                     details = error.response["Error"]
                     code = details.get("Code", "InternalServerException")
-                    status = 404 if code == "ResourceNotFoundException" else 400
-                    self._send_json(
-                        status,
-                        {"message": details.get("Message", "")},
-                        error_code=code,
-                    )
+                    status = _ERROR_STATUS.get(code, 400)
+                    # Modeled members such as a ConflictException's reason and
+                    # resourceId go in the body, where botocore parses them.
+                    body = {
+                        key: value
+                        for key, value in details.items()
+                        if key not in ("Code", "Message")
+                    }
+                    body["message"] = details.get("Message", "")
+                    self._send_json(status, body, error_code=code)
                 except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
                     self.close_connection = True
                 except Exception as error:
@@ -564,6 +698,9 @@ def _make_handler(
 
         def do_PATCH(self) -> None:
             self._dispatch("PATCH")
+
+        def do_DELETE(self) -> None:
+            self._dispatch("DELETE")
 
     return Handler
 
